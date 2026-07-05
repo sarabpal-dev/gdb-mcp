@@ -1,0 +1,1259 @@
+# GDB MCP Server integration via FastMCP with Screen Mirroring
+
+python
+import threading
+import traceback
+import logging
+import time
+import json
+import re
+import os
+from collections import deque
+
+try:
+    import gdb
+except Exception as e:
+    raise RuntimeError("This script requires GDB with Python support") from e
+
+# Configure logging to suppress HTTP request INFO messages
+# This must be done before FastMCP initializes
+logging.basicConfig(level=logging.WARNING)
+for _logger_name in ("uvicorn", "uvicorn.access", "uvicorn.error",
+                     "httpx", "httpcore", "fastmcp"):
+    logging.getLogger(_logger_name).setLevel(logging.WARNING)
+
+_mcp_thread = None
+_mcp_running = False
+_command_logger = None
+_prompt_capture = None
+
+
+class CommandLogger:
+    """Thread-safe command and output logger for screen mirroring"""
+    
+    def __init__(self, max_history=1000):
+        self.history = deque(maxlen=max_history)
+        self.max_history = max_history
+        self.lock = threading.Lock()
+    
+    def log_command(self, source, command, output, timestamp=None):
+        """
+        Log a command with its output and source attribution.
+        
+        Args:
+            source: Command source ("USER", "MCP", or "SYSTEM")
+            command: The command string that was executed
+            output: The output from the command
+            timestamp: Optional timestamp (defaults to current time)
+        """
+        if timestamp is None:
+            timestamp = time.time()
+        
+        entry = {
+            "timestamp": timestamp,
+            "source": source,
+            "command": command,
+            "output": output,
+            "output_size": len(output) if output else 0
+        }
+        
+        with self.lock:
+            self.history.append(entry)
+    
+    def get_history(self, limit=50, source_filter=None):
+        """
+        Retrieve command history with optional filtering.
+        
+        Args:
+            limit: Maximum number of entries to return
+            source_filter: Optional filter by source ("USER", "MCP", "SYSTEM", or None for all)
+        
+        Returns:
+            List of history entries (most recent first)
+        """
+        with self.lock:
+            # Convert deque to list and reverse for most recent first
+            history_list = list(self.history)
+            history_list.reverse()
+            
+            # Apply source filter if specified
+            if source_filter and source_filter.upper() != "ALL":
+                history_list = [
+                    entry for entry in history_list 
+                    if entry["source"].upper() == source_filter.upper()
+                ]
+            
+            # Apply limit
+            return history_list[:limit]
+    
+    def get_recent_output(self, count=1):
+        """
+        Get output from the last N commands.
+        
+        Args:
+            count: Number of recent command outputs to retrieve
+        
+        Returns:
+            List of output strings (most recent first)
+        """
+        with self.lock:
+            history_list = list(self.history)
+            history_list.reverse()
+            return [entry["output"] for entry in history_list[:count]]
+    
+    def get_stats(self):
+        """Get statistics about the command history"""
+        with self.lock:
+            total = len(self.history)
+            if total == 0:
+                return {
+                    "total_commands": 0,
+                    "user_commands": 0,
+                    "mcp_commands": 0,
+                    "system_commands": 0
+                }
+            
+            user_count = sum(1 for e in self.history if e["source"] == "USER")
+            mcp_count = sum(1 for e in self.history if e["source"] == "MCP")
+            system_count = sum(1 for e in self.history if e["source"] == "SYSTEM")
+            
+            return {
+                "total_commands": total,
+                "user_commands": user_count,
+                "mcp_commands": mcp_count,
+                "system_commands": system_count,
+                "max_history": self.max_history
+            }
+
+
+class PromptOutputCapture:
+    """Capture user command outputs using gdb.prompt_hook.
+    
+    gdb.prompt_hook fires synchronously in the GDB main thread right before
+    GDB displays the next prompt. At that point:
+      - The previous command has already finished executing
+      - All output has already been written to the log file
+      - We can read the log delta (last_position → current_position) to get output
+      - We can check `show commands` to identify what command produced it
+    
+    This solves the fundamental timing issue of the old polling approach where
+    we detected commands AFTER their output was already written, making
+    position-based tracking impossible.
+    """
+    
+    def __init__(self, command_logger):
+        self.command_logger = command_logger
+        self.log_file = None
+        self.log_enabled = False
+        self.last_log_position = 0
+        self.last_cmd_num = 0
+        self.installed = False
+        # Commands to skip (internal/MCP commands that we log separately)
+        self.skip_commands = frozenset([
+            'show commands', 'show logging', 'mcp-server', 'mcp-status',
+            'set logging file', 'set logging overwrite',
+            'set logging redirect', 'set logging enabled',
+        ])
+    
+    def start(self):
+        """Enable GDB logging and install the prompt hook."""
+        if self.installed:
+            return
+        
+        # Enable GDB logging to capture outputs
+        try:
+            pid = os.getpid()
+            self.log_file = f"/tmp/gdb-output-{pid}.log"
+            gdb.execute(f"set logging file {self.log_file}")
+            gdb.execute("set logging overwrite off")
+            gdb.execute("set logging redirect off")
+            gdb.execute("set logging enabled on")
+            self.log_enabled = True
+        except Exception as e:
+            gdb.write(f"[mcp] Warning: Could not enable output logging: {e}\n", gdb.STDERR)
+            return
+        
+        # Initialize log position to current end-of-file
+        self.last_log_position = self._get_log_position()
+        
+        # Initialize last command number from history
+        self.last_cmd_num = self._get_last_cmd_num()
+        
+        # Install prompt hook
+        # gdb.prompt_hook is called synchronously before each prompt display.
+        # We save any previous hook and chain to it.
+        self._prev_prompt_hook = gdb.prompt_hook
+        gdb.prompt_hook = self._prompt_hook
+        self.installed = True
+    
+    def stop(self):
+        """Uninstall the prompt hook."""
+        if not self.installed:
+            return
+        gdb.prompt_hook = self._prev_prompt_hook
+        self.installed = False
+    
+    def _prompt_hook(self, current_prompt):
+        """Called synchronously by GDB before displaying each prompt.
+        
+        At this point the previous command has finished and its output
+        is fully written to the log file. We:
+          1. Read the log delta since the last prompt
+          2. Check if a new user command appeared in history
+          3. If so, log the command with its captured output
+          4. Update the log position for the next cycle
+        """
+        try:
+            self._capture_cycle()
+        except Exception:
+            # Never let exceptions escape the prompt hook — that would break GDB
+            pass
+        
+        # Chain to previous prompt hook if any
+        if self._prev_prompt_hook:
+            return self._prev_prompt_hook(current_prompt)
+        return None
+    
+    def _capture_cycle(self):
+        """One capture cycle: detect new command + read its output from log."""
+        if not self.log_enabled:
+            return
+        
+        # 1. Read log output since last prompt
+        current_pos = self._get_log_position()
+        output = ""
+        if current_pos > self.last_log_position:
+            output = self._read_log_range(self.last_log_position, current_pos)
+            output = self._clean_output(output)
+        
+        # 2. Check for new user command(s)
+        current_cmd_num, commands = self._get_new_commands()
+        
+        if commands:
+            # We have new user commands since last prompt.
+            # For a single command (the common case), the entire log delta
+            # is that command's output.
+            # For multiple rapid commands (rare in interactive use), we
+            # attribute the combined output to the last command and log
+            # earlier commands with empty output.
+            
+            if len(commands) == 1:
+                cmd_num, cmd_text = commands[0]
+                self.command_logger.log_command(
+                    source="USER",
+                    command=cmd_text,
+                    output=output
+                )
+            else:
+                # Multiple commands detected between prompts.
+                # Log earlier ones with empty output, last one gets the output.
+                for cmd_num, cmd_text in commands[:-1]:
+                    self.command_logger.log_command(
+                        source="USER",
+                        command=cmd_text,
+                        output=""
+                    )
+                last_num, last_text = commands[-1]
+                self.command_logger.log_command(
+                    source="USER",
+                    command=last_text,
+                    output=output
+                )
+        
+        # 3. Update position for next cycle
+        self.last_log_position = current_pos
+        self.last_cmd_num = current_cmd_num if current_cmd_num > self.last_cmd_num else self.last_cmd_num
+    
+    def _get_last_cmd_num(self):
+        """Get the highest command number from GDB history."""
+        try:
+            history = gdb.execute("show commands", to_string=True)
+            lines = history.strip().split('\n')
+            max_num = 0
+            for line in lines:
+                match = re.match(r'\s+(\d+)\s+', line)
+                if match:
+                    num = int(match.group(1))
+                    if num > max_num:
+                        max_num = num
+            return max_num
+        except Exception:
+            return 0
+    
+    def _get_new_commands(self):
+        """Get new commands since last_cmd_num.
+        
+        Returns:
+            (current_max_num, [(cmd_num, cmd_text), ...])
+            where the list only contains user commands (not MCP/internal).
+        """
+        try:
+            history = gdb.execute("show commands", to_string=True)
+        except Exception:
+            return self.last_cmd_num, []
+        
+        lines = history.strip().split('\n')
+        max_num = self.last_cmd_num
+        new_commands = []
+        
+        for line in lines:
+            match = re.match(r'\s+(\d+)\s+(.+)$', line)
+            if not match:
+                continue
+            
+            cmd_num = int(match.group(1))
+            cmd_text = match.group(2).strip()
+            
+            if cmd_num > max_num:
+                max_num = cmd_num
+            
+            # Only process commands newer than what we've seen
+            if cmd_num <= self.last_cmd_num:
+                continue
+            
+            # Skip internal/MCP commands
+            if (cmd_text.startswith('[MCP]') or
+                cmd_text.startswith('[SYSTEM]') or
+                cmd_text in self.skip_commands or
+                cmd_text.startswith('set logging') or
+                cmd_text.startswith('show commands')):
+                continue
+            
+            new_commands.append((cmd_num, cmd_text))
+        
+        return max_num, new_commands
+    
+    def _get_log_position(self):
+        """Get current end-of-file position in log file."""
+        if not self.log_enabled or not self.log_file:
+            return 0
+        try:
+            if os.path.exists(self.log_file):
+                with open(self.log_file, 'r') as f:
+                    f.seek(0, 2)  # Seek to end
+                    return f.tell()
+        except Exception:
+            pass
+        return 0
+    
+    def _read_log_range(self, start_pos, end_pos):
+        """Read log file from start_pos to end_pos with size limits."""
+        if not self.log_enabled or not self.log_file:
+            return ""
+        try:
+            if not os.path.exists(self.log_file):
+                return ""
+            with open(self.log_file, 'r') as f:
+                f.seek(start_pos)
+                bytes_to_read = end_pos - start_pos
+                if bytes_to_read <= 0:
+                    return ""
+                # Limit to 100KB per command
+                max_read = 100 * 1024
+                if bytes_to_read > max_read:
+                    output = f.read(max_read)
+                    truncated_bytes = bytes_to_read - max_read
+                    return output + f"\n\n... (output truncated, {truncated_bytes:,} bytes omitted)"
+                else:
+                    return f.read(bytes_to_read)
+        except Exception as e:
+            return f"(error reading output: {e})"
+    
+    def _clean_output(self, raw_output):
+        """Clean and validate captured output."""
+        if not raw_output:
+            return ""
+        
+        lines = raw_output.split('\n')
+        cleaned_lines = []
+        
+        for line in lines:
+            # Skip MCP/SYSTEM prefixes echoed to log
+            if line.startswith('[MCP]') or line.startswith('[SYSTEM]'):
+                continue
+            cleaned_lines.append(line)
+        
+        # Remove leading empty lines
+        while cleaned_lines and not cleaned_lines[0].strip():
+            cleaned_lines.pop(0)
+        
+        # Remove trailing empty lines
+        while cleaned_lines and not cleaned_lines[-1].strip():
+            cleaned_lines.pop()
+        
+        return '\n'.join(cleaned_lines)
+
+
+def _run_gdb_command(cmd: str) -> str:
+    """
+    Execute a GDB command (original implementation without echo).
+    Used internally for system commands that don't need visibility.
+    """
+    result = {"out": "", "err": None, "done": False}
+    cond = threading.Condition()
+
+    def _do_exec():
+        try:
+            out = gdb.execute(cmd, to_string=True)
+            with cond:
+                result["out"] = out
+                result["done"] = True
+                cond.notify_all()
+        except Exception as ex:
+            with cond:
+                result["err"] = f"{type(ex).__name__}: {ex}"
+                result["done"] = True
+                cond.notify_all()
+
+    gdb.post_event(_do_exec)
+    with cond:
+        while not result["done"]:
+            cond.wait(timeout=0.05)
+    if result["err"]:
+        return f"ERROR: {result['err']}"
+    return result["out"]
+
+
+def _run_gdb_command_with_echo(cmd: str, source="MCP", echo=True) -> str:
+    """
+    Execute a GDB command with console echo and logging for screen mirroring.
+    
+    Args:
+        cmd: The GDB command to execute
+        source: Command source attribution ("MCP", "USER", "SYSTEM")
+        echo: Whether to echo the command and output to console
+    
+    Returns:
+        Command output string or error message
+    """
+    result = {"out": "", "err": None, "done": False}
+    cond = threading.Condition()
+    
+    # Echo command to console if requested
+    if echo and source != "SYSTEM":
+        gdb.write(f"\n[{source}] {cmd}\n", gdb.STDLOG)
+    
+    def _do_exec():
+        try:
+            # Execute command and capture output
+            out = gdb.execute(cmd, to_string=True)
+            
+            # Echo output to console if requested
+            if echo and out:
+                gdb.write(out, gdb.STDOUT)
+            
+            with cond:
+                result["out"] = out if out else ""
+                result["done"] = True
+                cond.notify_all()
+            
+            # Log to history
+            if _command_logger:
+                _command_logger.log_command(source, cmd, out if out else "")
+                
+        except Exception as ex:
+            err_msg = f"{type(ex).__name__}: {ex}"
+            
+            # Echo error to console if requested
+            if echo:
+                gdb.write(f"ERROR: {err_msg}\n", gdb.STDERR)
+            
+            with cond:
+                result["err"] = err_msg
+                result["done"] = True
+                cond.notify_all()
+            
+            # Log error to history
+            if _command_logger:
+                _command_logger.log_command(source, cmd, f"ERROR: {err_msg}")
+    
+    gdb.post_event(_do_exec)
+    
+    with cond:
+        while not result["done"]:
+            cond.wait(timeout=0.05)
+    
+    if result["err"]:
+        return f"ERROR: {result['err']}"
+    return result["out"]
+
+
+def _build_fastmcp_app():
+    try:
+        from fastmcp import FastMCP
+    except Exception as e:
+        gdb.write(f"[mcp] Failed to import fastmcp: {e}\n")
+        return None, None
+
+    app = FastMCP("gdb-mcp")
+
+    @app.tool()
+    def gdb_command(command: str) -> str:
+        """
+        Execute a GDB command with console echo and logging.
+        The command and its output will be visible in the GDB console with [MCP] prefix.
+        
+        Args:
+            command: The GDB command to execute (e.g., "info registers", "backtrace")
+        
+        Returns:
+            Command output as string
+        """
+        return _run_gdb_command_with_echo(command, source="MCP", echo=True)
+    
+    @app.tool()
+    def get_command_history(limit: int = 50, source: str = "ALL") -> str:
+        """
+        Retrieve command history with optional source filtering.
+        Useful for understanding what commands have been executed and their outputs.
+        
+        Args:
+            limit: Maximum number of history entries to return (default: 50)
+            source: Filter by command source - "USER", "MCP", "SYSTEM", or "ALL" (default: "ALL")
+        
+        Returns:
+            JSON string containing command history with timestamps, sources, commands, and outputs
+        """
+        if not _command_logger:
+            return json.dumps({"error": "Command logger not initialized"})
+        
+        history = _command_logger.get_history(limit, source)
+        return json.dumps(history, indent=2)
+    
+    @app.tool()
+    def get_recent_output(count: int = 1) -> str:
+        """
+        Get output from the last N commands.
+        Useful for retrieving recent command results without full history.
+        
+        Args:
+            count: Number of recent command outputs to retrieve (default: 1)
+        
+        Returns:
+            Concatenated output from the last N commands, separated by "---"
+        """
+        if not _command_logger:
+            return "ERROR: Command logger not initialized"
+        
+        outputs = _command_logger.get_recent_output(count)
+        return "\n---\n".join(outputs)
+    
+    @app.tool()
+    def get_console_state() -> str:
+        """
+        Get a snapshot of current GDB debugging state.
+        Includes backtrace, registers, and thread information.
+        
+        Returns:
+            JSON string containing current GDB state
+        """
+        state = {}
+        
+        # Get backtrace
+        try:
+            state['backtrace'] = _run_gdb_command_with_echo("bt", source="SYSTEM", echo=False)
+        except Exception as e:
+            state['backtrace'] = f"ERROR: {e}"
+        
+        # Get registers
+        try:
+            state['registers'] = _run_gdb_command_with_echo("info registers", source="SYSTEM", echo=False)
+        except Exception as e:
+            state['registers'] = f"ERROR: {e}"
+        
+        # Get threads
+        try:
+            state['threads'] = _run_gdb_command_with_echo("info threads", source="SYSTEM", echo=False)
+        except Exception as e:
+            state['threads'] = f"ERROR: {e}"
+        
+        return json.dumps(state, indent=2)
+    
+    @app.tool()
+    def get_logger_stats() -> str:
+        """
+        Get statistics about command history and logger status.
+        
+        Returns:
+            JSON string containing logger statistics
+        """
+        if not _command_logger:
+            return json.dumps({"error": "Command logger not initialized"})
+        
+        stats = _command_logger.get_stats()
+        return json.dumps(stats, indent=2)
+
+    @app.tool()
+    def set_breakpoint_commands(breakpoint_number: int, commands: list[str], silent: bool = False) -> str:
+        """
+        Set up a command script for a breakpoint, just like GDB's interactive:
+          (gdb) commands <breakpoint_number>
+          Type commands for breakpoint(s) N, one per line.
+          End with a line saying just "end".
+          > <cmd1>
+          > <cmd2>
+          > end
+
+        The commands will execute automatically every time the breakpoint is hit.
+
+        Common use cases:
+          - Print variables and continue: ["print x", "print y", "continue"]
+          - Log silently:  silent=True, ["printf \"x=%d\\n\", x", "continue"]
+          - Conditional action: ["if x > 100", "print x", "end", "continue"]
+
+        Args:
+            breakpoint_number: The breakpoint number (from 'info breakpoints')
+            commands: List of GDB commands to execute when breakpoint is hit
+            silent: If True, prepends 'silent' so the breakpoint hit is not announced
+
+        Returns:
+            Confirmation message or error
+        """
+        if not commands:
+            return "ERROR: commands list cannot be empty"
+
+        # Build the multi-line commands block for gdb.execute
+        # GDB accepts this as a single string with embedded newlines
+        cmd_lines = []
+        if silent:
+            cmd_lines.append("silent")
+        cmd_lines.extend(commands)
+
+        # Construct the full commands block:
+        #   commands <N>
+        #   <line1>
+        #   <line2>
+        #   end
+        script = f"commands {breakpoint_number}\n"
+        for line in cmd_lines:
+            script += f"{line}\n"
+        script += "end"
+
+        result = _run_gdb_command_with_echo(script, source="MCP", echo=True)
+
+        # Verify by checking the breakpoint info
+        verify = _run_gdb_command_with_echo(
+            f"info breakpoints {breakpoint_number}",
+            source="SYSTEM", echo=False
+        )
+
+        return (
+            f"Commands set for breakpoint {breakpoint_number}:\n"
+            f"  Silent: {silent}\n"
+            f"  Commands ({len(commands)}):\n"
+            + "\n".join(f"    > {c}" for c in commands)
+            + f"\n\nBreakpoint info:\n{verify}"
+        )
+
+    @app.tool()
+    def get_breakpoint_commands(breakpoint_number: int = 0) -> str:
+        """
+        Show the commands attached to a breakpoint.
+        If breakpoint_number is 0, shows commands for all breakpoints.
+
+        This is equivalent to:
+          (gdb) info breakpoints <N>
+        and inspecting the command list attached.
+
+        Args:
+            breakpoint_number: Breakpoint number (0 = all breakpoints)
+
+        Returns:
+            Breakpoint info including any attached command scripts
+        """
+        if breakpoint_number > 0:
+            cmd = f"info breakpoints {breakpoint_number}"
+        else:
+            cmd = "info breakpoints"
+
+        return _run_gdb_command_with_echo(cmd, source="MCP", echo=True)
+
+    @app.tool()
+    def clear_breakpoint_commands(breakpoint_number: int) -> str:
+        """
+        Remove all commands attached to a breakpoint.
+        Sets an empty command list, so the breakpoint just stops normally.
+
+        Equivalent to:
+          (gdb) commands <N>
+          > end
+
+        Args:
+            breakpoint_number: The breakpoint number to clear commands from
+
+        Returns:
+            Confirmation message
+        """
+        script = f"commands {breakpoint_number}\nend"
+        result = _run_gdb_command_with_echo(script, source="MCP", echo=True)
+
+        return f"Commands cleared for breakpoint {breakpoint_number}.\n{result}"
+
+    # ── Thread & Frame Navigation ──────────────────────────────────
+
+    @app.tool()
+    def gdb_get_threads() -> str:
+        """List all threads with id, target-id, name, and current frame.
+        Returns: JSON array of thread objects."""
+        raw = _run_gdb_command_with_echo("info threads", source="MCP", echo=True)
+        threads = []
+        for line in raw.splitlines():
+            m = re.match(r'(\*)?\s+(\d+)\s+(.+)', line)
+            if m:
+                threads.append({
+                    "current": m.group(1) == '*',
+                    "id": int(m.group(2)),
+                    "details": m.group(3).strip()
+                })
+        return json.dumps(threads, indent=2) if threads else raw
+
+    @app.tool()
+    def gdb_select_thread(thread_id: int) -> str:
+        """Switch to a specific thread by its GDB thread id.
+        Args: thread_id: Thread number from info threads."""
+        return _run_gdb_command_with_echo(f"thread {thread_id}", source="MCP", echo=True)
+
+    @app.tool()
+    def gdb_get_backtrace(full: bool = False, limit: int = 0) -> str:
+        """Get the stack backtrace for the current thread.
+        Args:
+            full: If True, also print local variables in each frame.
+            limit: Max frames (0 = unlimited)."""
+        cmd = "bt full" if full else "bt"
+        if limit > 0:
+            cmd += f" {limit}"
+        return _run_gdb_command_with_echo(cmd, source="MCP", echo=True)
+
+    @app.tool()
+    def gdb_select_frame(frame_number: int) -> str:
+        """Select a stack frame by number (0 = innermost).
+        Args: frame_number: Frame index from backtrace."""
+        return _run_gdb_command_with_echo(f"frame {frame_number}", source="MCP", echo=True)
+
+    @app.tool()
+    def gdb_get_frame_info() -> str:
+        """Get detailed info about the currently selected stack frame.
+        Returns: JSON with frame, args, locals, and source location."""
+        state = {}
+        state["frame"] = _run_gdb_command_with_echo("info frame", source="SYSTEM", echo=False)
+        state["args"] = _run_gdb_command_with_echo("info args", source="SYSTEM", echo=False)
+        state["locals"] = _run_gdb_command_with_echo("info locals", source="SYSTEM", echo=False)
+        try:
+            state["source"] = _run_gdb_command_with_echo("list", source="SYSTEM", echo=False)
+        except Exception:
+            state["source"] = ""
+        return json.dumps(state, indent=2)
+
+    # ── Breakpoint Management ──────────────────────────────────────
+
+    @app.tool()
+    def gdb_set_breakpoint(location: str, condition: str = "", temporary: bool = False, hardware: bool = False) -> str:
+        """Set a breakpoint at location (function, file:line, or *address).
+        Args:
+            location: e.g. 'main', 'foo.c:42', '*0x400520'
+            condition: Optional conditional expression (e.g. 'x > 5')
+            temporary: If True, breakpoint auto-deletes after first hit
+            hardware: If True, use hardware breakpoint."""
+        prefix = "thbreak" if temporary and hardware else "tbreak" if temporary else "hbreak" if hardware else "break"
+        cmd = f"{prefix} {location}"
+        result = _run_gdb_command_with_echo(cmd, source="MCP", echo=True)
+        if condition:
+            # Extract breakpoint number from output like "Breakpoint 3 at 0x..."
+            m = re.search(r'[Bb]reakpoint\s+(\d+)', result)
+            if m:
+                bp_num = m.group(1)
+                cond_result = _run_gdb_command_with_echo(
+                    f"condition {bp_num} {condition}", source="MCP", echo=True)
+                result += f"\n{cond_result}"
+        return result
+
+    @app.tool()
+    def gdb_list_breakpoints() -> str:
+        """List all breakpoints with full detail.
+        Returns: Raw info breakpoints output."""
+        return _run_gdb_command_with_echo("info breakpoints", source="MCP", echo=True)
+
+    @app.tool()
+    def gdb_delete_breakpoint(breakpoint_number: int) -> str:
+        """Delete a breakpoint by its number.
+        Args: breakpoint_number: Breakpoint number to delete."""
+        return _run_gdb_command_with_echo(f"delete {breakpoint_number}", source="MCP", echo=True)
+
+    @app.tool()
+    def gdb_enable_breakpoint(breakpoint_number: int) -> str:
+        """Enable a disabled breakpoint.
+        Args: breakpoint_number: Breakpoint number to enable."""
+        return _run_gdb_command_with_echo(f"enable {breakpoint_number}", source="MCP", echo=True)
+
+    @app.tool()
+    def gdb_disable_breakpoint(breakpoint_number: int) -> str:
+        """Disable a breakpoint without deleting it.
+        Args: breakpoint_number: Breakpoint number to disable."""
+        return _run_gdb_command_with_echo(f"disable {breakpoint_number}", source="MCP", echo=True)
+
+    # ── Execution Control ──────────────────────────────────────────
+
+    @app.tool()
+    def gdb_continue(ignore_count: int = 0) -> str:
+        """Continue execution. Optionally skip the current breakpoint N times.
+        Args: ignore_count: Number of times to skip before stopping (0 = stop next hit)."""
+        cmd = f"continue {ignore_count}" if ignore_count > 0 else "continue"
+        return _run_gdb_command_with_echo(cmd, source="MCP", echo=True)
+
+    @app.tool()
+    def gdb_step(count: int = 1) -> str:
+        """Step into: execute one source line, entering called functions.
+        Args: count: Number of steps to take."""
+        return _run_gdb_command_with_echo(f"step {count}", source="MCP", echo=True)
+
+    @app.tool()
+    def gdb_next(count: int = 1) -> str:
+        """Step over: execute one source line, skipping over function calls.
+        Args: count: Number of steps to take."""
+        return _run_gdb_command_with_echo(f"next {count}", source="MCP", echo=True)
+
+    @app.tool()
+    def gdb_stepi(count: int = 1) -> str:
+        """Step one machine instruction, entering calls.
+        Args: count: Number of instructions to step."""
+        return _run_gdb_command_with_echo(f"stepi {count}", source="MCP", echo=True)
+
+    @app.tool()
+    def gdb_nexti(count: int = 1) -> str:
+        """Step one machine instruction, skipping over calls.
+        Args: count: Number of instructions to step."""
+        return _run_gdb_command_with_echo(f"nexti {count}", source="MCP", echo=True)
+
+    @app.tool()
+    def gdb_finish() -> str:
+        """Run until the current function returns, then stop."""
+        return _run_gdb_command_with_echo("finish", source="MCP", echo=True)
+
+    @app.tool()
+    def gdb_until(location: str = "") -> str:
+        """Continue until past the current line or to a specific location.
+        Args: location: Optional target (e.g. 'foo.c:50', or empty for next line)."""
+        cmd = f"until {location}" if location else "until"
+        return _run_gdb_command_with_echo(cmd, source="MCP", echo=True)
+
+    @app.tool()
+    def gdb_interrupt() -> str:
+        """Interrupt/pause a running program (like Ctrl+C in GDB)."""
+        return _run_gdb_command_with_echo("interrupt", source="MCP", echo=True)
+
+    # ── Data Inspection ────────────────────────────────────────────
+
+    @app.tool()
+    def gdb_evaluate_expression(expression: str) -> str:
+        """Evaluate any GDB expression and return the result.
+        Supports C expressions, casts, dereferences, GDB convenience vars, etc.
+        Args: expression: e.g. 'sizeof(struct task_struct)', '*(int*)0x7fff5000', '$rax+8'."""
+        return _run_gdb_command_with_echo(f"print {expression}", source="MCP", echo=True)
+
+    @app.tool()
+    def gdb_get_variables() -> str:
+        """Get all local variables in the current frame.
+        Returns: info locals output."""
+        return _run_gdb_command_with_echo("info locals", source="MCP", echo=True)
+
+    @app.tool()
+    def gdb_get_registers(register_set: str = "") -> str:
+        """Get CPU register values.
+        Args: register_set: Empty for general regs, 'all' for all, or specific like 'rax rbx'."""
+        if register_set == "all":
+            return _run_gdb_command_with_echo("info all-registers", source="MCP", echo=True)
+        elif register_set:
+            return _run_gdb_command_with_echo(f"info registers {register_set}", source="MCP", echo=True)
+        return _run_gdb_command_with_echo("info registers", source="MCP", echo=True)
+
+    @app.tool()
+    def gdb_read_memory(address: str, count: int = 16, format: str = "x", size: str = "b") -> str:
+        """Read memory using GDB's x command.
+        Args:
+            address: Start address (e.g. '0x7fff5000', '$rsp', '&variable')
+            count: Number of units to display
+            format: x(hex) d(decimal) u(unsigned) o(octal) t(binary) a(addr) c(char) s(string) i(instruction)
+            size: b(byte) h(halfword/2B) w(word/4B) g(giant/8B)."""
+        return _run_gdb_command_with_echo(f"x/{count}{format}{size} {address}", source="MCP", echo=True)
+
+    @app.tool()
+    def gdb_disassemble(location: str = "", count: int = 0) -> str:
+        """Disassemble instructions at a location.
+        Args:
+            location: Function name, address, or empty for current PC
+            count: If >0, disassemble this many instructions from location."""
+        if count > 0 and location:
+            return _run_gdb_command_with_echo(f"x/{count}i {location}", source="MCP", echo=True)
+        elif location:
+            return _run_gdb_command_with_echo(f"disassemble {location}", source="MCP", echo=True)
+        return _run_gdb_command_with_echo("disassemble", source="MCP", echo=True)
+
+    @app.tool()
+    def gdb_write_memory(address: str, values: list[str]) -> str:
+        """Write values to memory. Each value is set as a byte.
+        Args:
+            address: Start address (e.g. '0x7fff5000')
+            values: List of byte values as hex strings (e.g. ['0x90', '0xcc'])."""
+        results = []
+        for i, val in enumerate(values):
+            r = _run_gdb_command_with_echo(
+                f"set *(unsigned char*)({address} + {i}) = {val}",
+                source="MCP", echo=True)
+            results.append(r)
+        verify = _run_gdb_command_with_echo(
+            f"x/{len(values)}xb {address}", source="MCP", echo=True)
+        return f"Wrote {len(values)} bytes at {address}\n{verify}"
+
+    # Keywords that open a block requiring a matching 'end'
+    _BLOCK_OPENERS = frozenset([
+        'if', 'while', 'define', 'document', 'commands', 'python', 'loop_break',
+    ])
+
+    def _is_block_opener(line):
+        """Check if a GDB command line opens a block that needs 'end'."""
+        stripped = line.strip().split()[0] if line.strip() else ''
+        return stripped in _BLOCK_OPENERS
+
+    @app.tool()
+    def gdb_run_script(commands: list[str]) -> str:
+        """Execute a multi-line GDB script with FULL block-awareness.
+
+        Automatically detects multi-line GDB constructs (while...end,
+        if...else...end, define...end, commands...end, python...end, etc.)
+        and sends them as atomic blocks so they execute correctly.
+
+        Single-line commands are sent individually. Prefix any command
+        with '-' to ignore errors on that command and continue.
+
+        Examples:
+            Simple sequential:
+                ["break main", "run", "info registers", "bt"]
+
+            Breakpoint with commands:
+                ["break main",
+                 "commands 1", "silent", "print $rax", "continue", "end",
+                 "run"]
+
+            While loop:
+                ["set $i = 0",
+                 "while $i < 10", "stepi", "set $i = $i + 1", "end",
+                 "info registers"]
+
+            Define custom command:
+                ["define dump_regs", "info registers", "x/16xg $rsp", "end",
+                 "break main", "run", "dump_regs"]
+
+            Nested if/while:
+                ["define smart_step",
+                 "set $n = 0",
+                 "while $n < $arg0",
+                 "stepi",
+                 "if $pc == $arg1", "print $rax", "loop_break", "end",
+                 "set $n = $n + 1",
+                 "end",
+                 "end"]
+
+            Ignore errors with '-' prefix:
+                ["-delete", "break *0x400520", "run"]
+
+        Args:
+            commands: List of GDB command lines to execute in order.
+        Returns:
+            Combined output from all commands/blocks with numbering.
+        """
+        outputs = []
+        i = 0
+        block_num = 0
+
+        while i < len(commands):
+            cmd = commands[i]
+            ignore_err = cmd.startswith('-')
+            actual_line = cmd[1:].strip() if ignore_err else cmd.strip()
+
+            # Check if this line opens a block
+            if _is_block_opener(actual_line):
+                # Accumulate lines until we close all nested blocks
+                block_lines = [actual_line]
+                depth = 1
+                i += 1
+                while i < len(commands) and depth > 0:
+                    bline = commands[i].strip()
+                    # Strip '-' prefix inside blocks (only meaningful at top level)
+                    if bline.startswith('-'):
+                        bline = bline[1:].strip()
+                    block_lines.append(bline)
+                    if _is_block_opener(bline):
+                        depth += 1
+                    elif bline == 'end':
+                        depth -= 1
+                    i += 1
+
+                block_num += 1
+                block_script = '\n'.join(block_lines)
+
+                try:
+                    out = _run_gdb_command_with_echo(block_script, source="MCP", echo=True)
+                    outputs.append(f"[block {block_num}] {block_lines[0]} ... end\n{out}")
+                except Exception as e:
+                    err_msg = f"[block {block_num}] {block_lines[0]} ... end\nERROR: {e}"
+                    outputs.append(err_msg)
+                    if not ignore_err:
+                        outputs.append(f"(Script stopped at block {block_num})")
+                        break
+            else:
+                # Single command — send individually
+                block_num += 1
+                try:
+                    out = _run_gdb_command_with_echo(actual_line, source="MCP", echo=True)
+                    outputs.append(f"[{block_num}] {actual_line}\n{out}")
+                except Exception as e:
+                    err_msg = f"[{block_num}] {actual_line}\nERROR: {e}"
+                    outputs.append(err_msg)
+                    if not ignore_err:
+                        outputs.append(f"(Script stopped at command {block_num})")
+                        break
+                i += 1
+
+        return "\n".join(outputs)
+
+    @app.tool()
+    def gdb_execute_script(script: str) -> str:
+        """Execute a raw multi-line GDB script as a single block.
+
+        Takes the ENTIRE script as one string (with newlines) and sends it
+        directly to gdb.execute(). This is the most powerful scripting tool —
+        it handles arbitrarily complex scripts exactly as if you typed them
+        into GDB's interactive prompt.
+
+        Use this for complex scripts where you want full control over the
+        exact text sent to GDB. For simpler use cases, prefer gdb_run_script.
+
+        Examples:
+            "break main\\nrun\\ninfo registers"
+
+            "define trace_calls\\n  silent\\n  bt 3\\n  continue\\nend"
+
+            "set $base = 0x7fff0000\\nset $i = 0\\nwhile $i < 256\\n  x/1xb $base + $i\\n  set $i = $i + 1\\nend"
+
+            "python\\nimport struct\\nmem = gdb.selected_inferior().read_memory(0x400000, 64)\\nfor i in range(0, 64, 8):\\n    val = struct.unpack('<Q', mem[i:i+8])[0]\\n    print(f'0x{0x400000+i:x}: 0x{val:016x}')\\nend"
+
+        Args:
+            script: Complete GDB script text with embedded newlines.
+        Returns:
+            Output from executing the script.
+        """
+        return _run_gdb_command_with_echo(script, source="MCP", echo=True)
+
+    @app.tool()
+    def gdb_set_variable(variable: str, value: str) -> str:
+        """Set a GDB variable or program variable.
+        Args:
+            variable: Variable name (e.g. '$rax', 'myvar', '$convenience_var')
+            value: Value to set (e.g. '42', '0x1000', '"hello"')."""
+        return _run_gdb_command_with_echo(f"set {variable} = {value}", source="MCP", echo=True)
+
+    @app.tool()
+    def gdb_define_function(name: str, body: list[str]) -> str:
+        """Define a custom GDB command (like 'define' in GDB).
+        Args:
+            name: Command name to define
+            body: List of GDB commands forming the body."""
+        script = f"define {name}\n"
+        for line in body:
+            script += f"{line}\n"
+        script += "end"
+        return _run_gdb_command_with_echo(script, source="MCP", echo=True)
+
+    @app.tool()
+    def gdb_source_file(filepath: str) -> str:
+        """Source/load a GDB script file.
+        Args: filepath: Path to a GDB script file (.gdb, .py, etc.)."""
+        return _run_gdb_command_with_echo(f"source {filepath}", source="MCP", echo=True)
+
+    @app.tool()
+    def gdb_set_option(option: str) -> str:
+        """Set any GDB option (pass the full 'set ...' argument).
+        Examples: 'pagination off', 'print pretty on', 'disassembly-flavor intel'.
+        Args: option: The option string after 'set'."""
+        return _run_gdb_command_with_echo(f"set {option}", source="MCP", echo=True)
+
+    @app.tool()
+    def gdb_show_option(option: str) -> str:
+        """Show any GDB option value.
+        Args: option: The option to query (e.g. 'disassembly-flavor', 'pagination')."""
+        return _run_gdb_command_with_echo(f"show {option}", source="MCP", echo=True)
+
+    @app.tool()
+    def gdb_watchpoint(expression: str, watch_type: str = "write") -> str:
+        """Set a watchpoint on an expression.
+        Args:
+            expression: Expression to watch (e.g. '*0x7fff5000', 'myvar')
+            watch_type: 'write' (stop on write), 'read' (stop on read), 'access' (both)."""
+        if watch_type == "read":
+            cmd = f"rwatch {expression}"
+        elif watch_type == "access":
+            cmd = f"awatch {expression}"
+        else:
+            cmd = f"watch {expression}"
+        return _run_gdb_command_with_echo(cmd, source="MCP", echo=True)
+
+    @app.tool()
+    def gdb_catchpoint(event: str) -> str:
+        """Set a catchpoint for system events.
+        Args: event: Event to catch - 'syscall', 'throw', 'catch', 'fork', 'exec',
+              'signal SIGNAME', 'syscall NAME/NUMBER', etc."""
+        return _run_gdb_command_with_echo(f"catch {event}", source="MCP", echo=True)
+
+    def run_sse(host, port):
+        import asyncio
+        # Suppress uvicorn access logs (it reconfigures loggers on startup)
+        for _name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
+            logging.getLogger(_name).setLevel(logging.WARNING)
+        asyncio.run(app.run_async(
+            transport="sse", host=host, port=port,
+            log_level="warning",
+        ))
+
+    return app, run_sse
+
+
+class McpServerCommand(gdb.Command):
+    """Start a FastMCP SSE server inside GDB with screen mirroring.
+Usage:
+  mcp-server <host> <port>
+Example:
+  mcp-server 127.0.0.1 3333
+    """
+
+    def __init__(self):
+        super(McpServerCommand, self).__init__("mcp-server", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        global _mcp_thread, _mcp_running, _command_logger, _prompt_capture
+        argv = gdb.string_to_argv(arg)
+        if len(argv) != 2:
+            raise gdb.GdbError("usage: mcp-server <host> <port>")
+        host, port_str = argv[0], argv[1]
+        try:
+            port = int(port_str)
+        except ValueError:
+            raise gdb.GdbError("port must be an integer")
+
+        if _mcp_running:
+            gdb.write("[mcp] Server already running\n")
+            return
+        
+        # Initialize command logger if not already done
+        if _command_logger is None:
+            _command_logger = CommandLogger(max_history=1000)
+            gdb.write("[mcp] Command logger initialized (history size: 1000)\n")
+        
+        # Initialize prompt-based output capture
+        if _prompt_capture is None:
+            _prompt_capture = PromptOutputCapture(_command_logger)
+            try:
+                _prompt_capture.start()
+                gdb.write("[mcp] Prompt-hook output capture installed — user commands + outputs will be captured\n")
+            except Exception as e:
+                gdb.write(f"[mcp] Warning: Could not install prompt capture: {e}\n", gdb.STDERR)
+                gdb.write("[mcp] User command outputs will not be captured\n")
+
+        app, runner = _build_fastmcp_app()
+        if app is None or runner is None:
+            raise gdb.GdbError("Failed to initialize FastMCP server")
+
+        def _serve():
+            global _mcp_running
+            _mcp_running = True
+            try:
+                gdb.write(f"[mcp] Starting SSE server on {host}:{port}...\n")
+                gdb.write("[mcp] Screen mirroring enabled - MCP commands will be visible in console\n")
+                runner(host, port)
+            except Exception:
+                traceback.print_exc()
+            finally:
+                _mcp_running = False
+                gdb.write("[mcp] Server stopped\n")
+
+        _mcp_thread = threading.Thread(target=_serve, name="gdb-mcp-sse", daemon=True)
+        _mcp_thread.start()
+        gdb.write("[mcp] Server launched in background.\n")
+
+
+class McpStatusCommand(gdb.Command):
+    """Show MCP server and screen mirroring status.
+Usage:
+  mcp-status
+    """
+
+    def __init__(self):
+        super(McpStatusCommand, self).__init__("mcp-status", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        global _mcp_running, _command_logger, _prompt_capture
+        
+        gdb.write("\n=== GDB MCP Server Status ===\n")
+        gdb.write(f"Server Status: {'Running' if _mcp_running else 'Stopped'}\n")
+        gdb.write(f"Screen Mirroring: {'Enabled' if _command_logger else 'Disabled'}\n")
+        
+        if _prompt_capture:
+            gdb.write(f"User Command Capture: {'Installed (prompt_hook)' if _prompt_capture.installed else 'Not installed'}\n")
+            gdb.write(f"Log File: {_prompt_capture.log_file or 'None'}\n")
+            gdb.write(f"Last Command #: {_prompt_capture.last_cmd_num}\n")
+        else:
+            gdb.write("User Command Capture: Disabled\n")
+        
+        if _command_logger:
+            stats = _command_logger.get_stats()
+            gdb.write(f"\n=== Command History Statistics ===\n")
+            gdb.write(f"Total Commands: {stats['total_commands']}\n")
+            gdb.write(f"User Commands: {stats['user_commands']}\n")
+            gdb.write(f"MCP Commands: {stats['mcp_commands']}\n")
+            gdb.write(f"System Commands: {stats['system_commands']}\n")
+            gdb.write(f"History Buffer Size: {stats['max_history']}\n")
+        
+        gdb.write("\n")
+
+
+# Register commands
+McpServerCommand()
+McpStatusCommand()
+
+# Print startup banner
+gdb.write("\n")
+gdb.write("=" * 60 + "\n")
+gdb.write("  GDB MCP Server — Full GDB Access via MCP\n")
+gdb.write("=" * 60 + "\n")
+gdb.write("Commands:\n")
+gdb.write("  mcp-server <host> <port>  - Start MCP server\n")
+gdb.write("  mcp-status                - Show server status\n")
+gdb.write("\n")
+gdb.write("MCP Tools (30+):\n")
+gdb.write("  gdb_command             - Run ANY GDB command (full access)\n")
+gdb.write("  gdb_run_script          - Run multi-command scripts\n")
+gdb.write("  gdb_define_function     - Define custom GDB commands\n")
+gdb.write("  gdb_source_file         - Load .gdb/.py script files\n")
+gdb.write("  ── Thread & Frame ─────────────────────────\n")
+gdb.write("  gdb_get_threads / gdb_select_thread\n")
+gdb.write("  gdb_get_backtrace / gdb_select_frame / gdb_get_frame_info\n")
+gdb.write("  ── Breakpoints ────────────────────────────\n")
+gdb.write("  gdb_set_breakpoint / gdb_list/delete/enable/disable\n")
+gdb.write("  set_breakpoint_commands / get/clear_breakpoint_commands\n")
+gdb.write("  gdb_watchpoint / gdb_catchpoint\n")
+gdb.write("  ── Execution ──────────────────────────────\n")
+gdb.write("  gdb_continue / step / next / stepi / nexti\n")
+gdb.write("  gdb_finish / gdb_until / gdb_interrupt\n")
+gdb.write("  ── Data & Memory ─────────────────────────\n")
+gdb.write("  gdb_evaluate_expression / gdb_get_variables\n")
+gdb.write("  gdb_get_registers / gdb_read_memory / gdb_write_memory\n")
+gdb.write("  gdb_disassemble / gdb_set_variable\n")
+gdb.write("  ── Screen Mirroring ───────────────────────\n")
+gdb.write("  get_command_history / get_recent_output\n")
+gdb.write("  get_console_state / get_logger_stats\n")
+gdb.write("\n")
+gdb.write("Example:\n")
+gdb.write("  (gdb) mcp-server 127.0.0.1 3333\n")
+gdb.write("=" * 60 + "\n")
+gdb.write("\n")
+
+end
