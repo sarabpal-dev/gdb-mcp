@@ -208,6 +208,44 @@ Both you and the AI can control GDB simultaneously:
 
 <sub>And 20+ more...</sub>
 
+### 💡 Tips for Better AI Collaboration
+
+> [!TIP]
+> **Avoiding AI Getting Stuck**
+> 
+> Sometimes the AI doesn't understand that the program is paused at a breakpoint and gets stuck waiting. Guide your AI to create **non-blocking debugging scripts** that don't pause execution:
+> 
+> ```gdb
+> # ❌ Bad: AI gets stuck waiting at breakpoint
+> break main
+> run
+> 
+> # ✅ Good: Auto-continue with live debug output
+> break main
+> commands
+>   silent
+>   printf "Hit main, argc=%d\n", argc
+>   continue
+> end
+> run
+> ```
+> 
+> **Prompt examples:**
+> - "Create breakpoints with auto-continue that print debug info without pausing"
+> - "Set up live debugging that shows variable values while the program runs"
+> - "Add breakpoints that log information but don't stop execution"
+
+> [!TIP]
+> **Manual Interrupt When AI is Stuck**
+> 
+> If the AI gets stuck because the program is running or blocked:
+> 
+> 1. Press `Ctrl+C` in GDB to interrupt the program
+> 2. This pauses execution and lets the AI execute commands properly
+> 3. Tell the AI: "I've paused the program, now you can inspect the state"
+> 
+> The AI can then use commands like `backtrace`, `info locals`, `print`, etc.
+
 ---
 
 ## Troubleshooting
